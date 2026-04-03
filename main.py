@@ -1,81 +1,142 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from model_logic import get_vector
-import numpy as np
-import uvicorn
+import os
+import io
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from PIL import Image
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, firestore
+import requests
+import numpy as np
 
 app = FastAPI()
 
-# --- 1. Firebase 初始化 ---
-# 請確保 serviceAccountKey.json 位於 C:\Users\User\pybackend\ 目錄下
-try:
-    cred = credentials.Certificate("serviceAccountKey.json")
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("✅ Firebase Admin SDK 初始化成功")
-except Exception as e:
-    print(f"❌ Firebase 初始化失敗: {e}")
+# 允許跨域請求 (React Native 開發必備)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get("/")
-async def root():
-    return {"status": "running", "message": "Zenkurenaido AI Backend is online"}
+# 1. 初始化 Firebase
+# 注意：部署到雲端時，建議將路徑改為環境變數讀取
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-@app.post("/compare")
-async def compare(product_id: str, file: UploadFile = File(...)):
+# 2. 初始化 AI 模型 (MobileNet V2)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
+model.classifier = nn.Identity() # 移除分類層，只提取特徵向量
+model.to(device)
+model.eval()
+
+preprocess = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+def get_vector(input_data, is_url=True):
+    """將圖片轉換為特徵向量"""
+    try:
+        if is_url:
+            response = requests.get(input_data, timeout=5)
+            img = Image.open(io.BytesIO(response.content)).convert('RGB')
+        else:
+            img = Image.open(io.BytesIO(input_data)).convert('RGB')
+        
+        tensor = preprocess(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            vector = model(tensor).cpu().numpy().flatten()
+        return vector
+    except Exception as e:
+        print(f"向量提取出錯: {e}")
+        return None
+
+# --- 新增：全自動比對接口 ---
+@app.post("/auto_compare")
+async def auto_compare(
+    user_id: str = Query(...), 
+    mode: str = Query("personal"),
+    file: UploadFile = File(...)
+):
     """
-    此介面會接收產品 ID，並自動從 Firestore 抓取該產品的 Cloudinary 網址進行比對
+    接收一張圖片，自動對比該用戶/家庭的所有庫存，回傳最像的結果。
     """
     try:
-        # --- 2. 從 Firestore 獲取基準產品資料 ---
-        # 根據你提供的截圖，集合名稱應為 "products"
-        doc_ref = db.collection("products").document(product_id)
-        doc = doc_ref.get()
-        
-        if not doc.exists:
-            raise HTTPException(status_code=404, detail=f"找不到 ID 為 {product_id} 的產品")
-        
-        data = doc.to_dict()
-        base_url = data.get("image")  # 這裡會抓到你的 https://res.cloudinary.com/... 網址
-        product_name = data.get("name", "未知物品")
+        # 1. 決定查詢目標 (個人或家庭)
+        target_id = user_id
+        id_field = "userId"
 
-        # --- 3. 網址有效性檢查 ---
-        if not base_url or not base_url.startswith("http"):
-             raise HTTPException(
-                 status_code=400, 
-                 detail=f"該產品圖片網址無效 (目前為: {base_url})。請確保圖片已成功上傳至 Cloudinary。"
-             )
+        if mode == "family":
+            family_ref = db.collection("family_members").where("userId", "==", user_id).limit(1).get()
+            if family_ref:
+                target_id = family_ref[0].to_dict().get("familyId")
+                id_field = "familyId"
 
-        print(f"🔍 正在比對物品: {product_name}")
-        print(f"🌐 基準圖網址: {base_url}")
+        # 2. 從 Firestore 抓取該用戶所有「有照片」的產品
+        products_ref = db.collection("products").where(id_field, "==", target_id).stream()
+        
+        # 3. 處理上傳的圖片
+        image_content = await file.read()
+        current_vector = get_vector(image_content, is_url=False)
+        
+        if current_vector is None:
+            raise HTTPException(status_code=400, detail="無法辨識上傳的圖片內容")
 
-        # --- 4. 提取基準圖向量 (從 Cloudinary 下載) ---
-        base_vector = get_vector(base_url, is_url=True)
-        
-        # --- 5. 提取目前上傳圖向量 (手機傳來的圖片) ---
-        content = await file.read()
-        current_vector = get_vector(content, is_url=False)
-        
-        # --- 6. 計算餘弦相似度 ---
-        # 相似度公式: (A · B) / (||A|| * ||B||)
-        similarity = np.dot(current_vector, base_vector) / (np.linalg.norm(current_vector) * np.linalg.norm(base_vector))
-        
-        # --- 7. 設定判定門檻 (建議 0.75 - 0.8) ---
-        match_threshold = 0.7
-        is_match = bool(similarity > match_threshold)
-        
-        return {
-            "status": "success",
-            "match": is_match,
-            "score": round(float(similarity), 4),
-            "product_name": product_name,
-            "threshold": match_threshold
-        }
+        best_match = None
+        highest_score = 0
+        threshold = 0.70  # 你之前測試成功的門檻
+
+        # 4. 在後端進行循環比對
+        for doc in products_ref:
+            p_data = doc.to_dict()
+            base_image_url = p_data.get("image")
+            
+            if not base_image_url:
+                continue
+                
+            base_vector = get_vector(base_image_url, is_url=True)
+            if base_vector is None: continue
+
+            # 計算餘弦相似度
+            similarity = np.dot(current_vector, base_vector) / (np.linalg.norm(current_vector) * np.linalg.norm(base_vector))
+            
+            if similarity > highest_score:
+                highest_score = float(similarity)
+                best_match = {
+                    "id": doc.id,
+                    "name": p_data.get("name"),
+                    "stock": p_data.get("stock", 0),
+                    "score": highest_score,
+                    "match": bool(highest_score >= threshold)
+                }
+
+        # 5. 回傳結果
+        if best_match and best_match["match"]:
+            return {"status": "success", "data": best_match}
+        else:
+            return {
+                "status": "not_found", 
+                "message": "找不到匹配物品", 
+                "best_guess": best_match["name"] if best_match else "未知",
+                "highest_score": highest_score
+            }
 
     except Exception as e:
-        print(f"⚠️ 伺服器內部錯誤: {str(e)}")
+        print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/")
+def read_root():
+    return {"status": "running", "message": "Zenkurenaido AI Backend is online"}
+
 if __name__ == "__main__":
-    # 啟動伺服器，監聽 8000 端口
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

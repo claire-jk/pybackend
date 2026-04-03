@@ -1,0 +1,7 @@
+# 排除 Firebase 私鑰
+serviceAccountKey.json
+
+# 排除 Python 環境與暫存
+__pycache__/
+venv/
+.env

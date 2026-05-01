@@ -280,11 +280,7 @@ def root():
     return {"status": "online"}
 @app.get("/version")
 def version():
-    return {
-        "version": "2026-05-02-main-v3",
-        "status": "running",
-        "note": "location fix + scan update"
-    }
+    return {"version": "test"}
 
 # ---------------------------------------------------------
 if __name__ == "__main__":

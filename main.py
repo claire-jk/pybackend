@@ -278,7 +278,13 @@ async def identify_by_name(
 @app.get("/")
 def root():
     return {"status": "online"}
-
+@app.get("/version")
+def version():
+    return {
+        "version": "2026-05-02-main-v3",
+        "status": "running",
+        "note": "location fix + scan update"
+    }
 
 # ---------------------------------------------------------
 if __name__ == "__main__":
